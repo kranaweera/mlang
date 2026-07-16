@@ -1,0 +1,8 @@
+[package]
+name = "mlang"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny ML-oriented language compiler (Milestone 1)"
+license = "MIT"
+
+[dependencies]
