@@ -37,31 +37,37 @@ impl Parser {
         while !self.symbol('}') {
             if matches!(self.peek(), Token::Eof) { return Err("unclosed function body".into()); }
             let statement = if self.keyword("let") {
-                let name = self.ident()?; self.expect('=')?; let expr = self.expr()?; Stmt::Let(name, expr)
-            } else if self.keyword("return") { Stmt::Return(self.expr()?) } else { Stmt::Expr(self.expr()?) };
+                let name = self.ident()?; self.expect('=')?; let expr = self.expr(0)?; Stmt::Let(name, expr)
+            } else if self.keyword("return") { Stmt::Return(self.expr(0)?) } else { Stmt::Expr(self.expr(0)?) };
             self.expect(';')?; body.push(statement);
         }
         Ok(Function { name, params, result, body })
     }
-    fn expr(&mut self) -> Result<Expr, String> {
-        let lhs = match self.bump() {
+    fn expr(&mut self, min_prec: u8) -> Result<Expr, String> {
+        let mut lhs = match self.bump() {
             Token::Number(n) => Expr::Number(n),
-            Token::Sym('-') => Expr::UnaryMinus(Box::new(self.expr()?)),
-            Token::Sym('(') => { let inner = self.expr()?; self.expect(')')?; inner },
+            Token::Sym('-') => Expr::UnaryMinus(Box::new(self.expr(5)?)),
+            Token::Sym('(') => { let inner = self.expr(0)?; self.expect(')')?; inner },
             Token::Sym('[') => {
                 let mut elems = Vec::new();
-                if !self.symbol(']') { loop { elems.push(self.expr()?); if self.symbol(']') { break; } self.expect(',')?; } }
+                if !self.symbol(']') { loop { elems.push(self.expr(0)?); if self.symbol(']') { break; } self.expect(',')?; } }
                 Expr::Vector(elems)
             }
             Token::Ident(name) => {
                 if self.symbol('(') {
                     let mut args = Vec::new();
-                    if !self.symbol(')') { loop { args.push(self.expr()?); if self.symbol(')') { break; } self.expect(',')?; } }
+                    if !self.symbol(')') { loop { args.push(self.expr(0)?); if self.symbol(')') { break; } self.expect(',')?; } }
                     Expr::Call(name, args)
                 } else { Expr::Var(name) }
             }
             t => return Err(format!("unexpected token in expression: {t:?}")),
         };
+        loop {
+            let (op, prec) = match self.peek() { Token::Sym('+') => ('+', 1), Token::Sym('-') => ('-', 1), Token::Sym('*') => ('*', 3), Token::Sym('/') => ('/', 3), _ => break };
+            if prec < min_prec { break; }
+            self.bump(); let rhs = self.expr(prec + 1)?;
+            lhs = Expr::Binary(Box::new(lhs), op, Box::new(rhs));
+        }
         Ok(lhs)
     }
 }
@@ -70,5 +76,9 @@ impl Parser {
 mod tests {
     use super::*;
     use crate::lexer::lex;
+    #[test] fn precedence() {
+        let p = Parser::new(lex("fn main(){ let x = 2 + 3 * 4; }").unwrap()).program().unwrap();
+        assert!(matches!(&p.functions[0].body[0], Stmt::Let(_, Expr::Binary(_, '+', _))));
+    }
     #[test] fn reject_incomplete() { assert!(Parser::new(lex("fn main() { return 1;").unwrap()).program().is_err()); }
 }
