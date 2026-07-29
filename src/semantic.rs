@@ -1,5 +1,5 @@
-use crate::ast::{Expr, Type};
-use std::collections::HashMap;
+use crate::ast::{Expr, Program, Stmt, Type};
+use std::collections::{HashMap, HashSet};
 
 pub fn infer(expr: &Expr, vars: &HashMap<String, Type>, sigs: &HashMap<String, (Vec<Type>, Option<Type>)>) -> Result<Type, String> {
     match expr {
@@ -28,4 +28,44 @@ pub fn infer(expr: &Expr, vars: &HashMap<String, Type>, sigs: &HashMap<String, (
             }
         }
     }
+}
+
+pub fn check(program: &Program) -> Result<(), String> {
+    let mut sigs = HashMap::new();
+    for f in &program.functions {
+        if f.name == "dot" || f.name == "print" { return Err(format!("reserved function name: {}", f.name)); }
+        if sigs.insert(f.name.clone(), (f.params.iter().map(|(_, t)| t.clone()).collect(), f.result.clone())).is_some() { return Err(format!("duplicate function {}", f.name)); }
+    }
+    if !sigs.contains_key("main") { return Err("missing fn main()".into()); }
+    let main = program.functions.iter().find(|f| f.name == "main").unwrap();
+    if !main.params.is_empty() || main.result.is_some() { return Err("main must have no parameters and no return type".into()); }
+    for f in &program.functions {
+        let mut vars = HashMap::new(); let mut seen = HashSet::new();
+        for (name, ty) in &f.params {
+            if !seen.insert(name.clone()) { return Err(format!("duplicate parameter {name}")); }
+            vars.insert(name.clone(), ty.clone());
+        }
+        let mut returned = false;
+        for stmt in &f.body {
+            if returned { return Err(format!("unreachable statement after return in {}", f.name)); }
+            match stmt {
+                Stmt::Let(name, expr) => {
+                    let ty = infer(expr, &vars, &sigs)?;
+                    if !seen.insert(name.clone()) { return Err(format!("duplicate variable {name}")); }
+                    vars.insert(name.clone(), ty);
+                }
+                Stmt::Return(expr) => {
+                    let ty = infer(expr, &vars, &sigs)?;
+                    if Some(ty) != f.result { return Err(format!("return type mismatch in {}", f.name)); }
+                    returned = true;
+                }
+                Stmt::Expr(Expr::Call(name, args)) if name == "print" => {
+                    if args.len() != 1 || infer(&args[0], &vars, &sigs)? != Type::F32 { return Err("print requires one f32 argument".into()); }
+                }
+                Stmt::Expr(expr) => { infer(expr, &vars, &sigs)?; }
+            }
+        }
+        if f.result.is_some() && !returned { return Err(format!("function {} requires a return statement", f.name)); }
+    }
+    Ok(())
 }
