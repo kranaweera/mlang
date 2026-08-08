@@ -8,6 +8,7 @@ pub fn infer(expr: &Expr, vars: &HashMap<String, Type>, sigs: &HashMap<String, (
         Expr::Vector(items) => {
             if items.is_empty() { return Err("empty vectors are not supported".into()); }
             for x in items { if infer(x, vars, sigs)? != Type::F32 { return Err("vector elements must be scalar f32".into()); } }
+            if items.len() > 4096 { return Err("vector too long (max 4096)".into()); }
             Ok(Type::Vector(items.len()))
         }
         Expr::UnaryMinus(x) => { if infer(x, vars, sigs)? != Type::F32 { return Err("unary minus expects f32".into()); } Ok(Type::F32) }

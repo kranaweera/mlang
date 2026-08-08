@@ -30,6 +30,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
             }
             let text: String = chars[start..pos].iter().collect();
             let n = text.parse::<f32>().map_err(|_| format!("invalid number {text}"))?;
+            if !n.is_finite() { return Err("non-finite float literal".into()); }
             out.push(Token::Number(n)); continue;
         }
         if "(){}[],:;=+-*/".contains(c) { out.push(Token::Sym(c)); pos += 1; continue; }
