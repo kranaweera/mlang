@@ -3,7 +3,7 @@ use crate::semantic::infer;
 use std::collections::{BTreeSet, HashMap};
 
 fn type_c(ty: &Type) -> String {
-    match ty { Type::F32 => "float".into(), Type::Vector(n) => format!("ml_vec_{n}") }
+    match ty { Type::F32 => "float".into(), Type::Vector(n) => format!("ml_vec_{n}"), Type::Matrix(r, c) => format!("ml_mat_{r}_{c}") }
 }
 fn expression(expr: &Expr, vars: &HashMap<String, Type>, sigs: &HashMap<String, (Vec<Type>, Option<Type>)>) -> String {
     match expr {

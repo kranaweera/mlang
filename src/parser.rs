@@ -11,10 +11,14 @@ impl Parser {
     fn keyword(&mut self, s: &str) -> bool { if self.peek() == &Token::Ident(s.to_string()) { self.bump(); true } else { false } }
     fn ident(&mut self) -> Result<String, String> { match self.bump() { Token::Ident(s) => Ok(s), t => Err(format!("expected identifier, found {t:?}")) } }
     fn ty(&mut self) -> Result<Type, String> {
-        if self.ident()? != "f32" { return Err("only f32 and f32[N] are supported".into()); }
+        if self.ident()? != "f32" { return Err("only f32, f32[N] and f32[R,C] are supported".into()); }
         if self.symbol('[') {
             let n = match self.bump() { Token::Number(n) if n >= 1.0 && n <= 4096.0 && n.fract() == 0.0 => n as usize, _ => return Err("array size must be an integer from 1 to 4096".into()) };
-            self.expect(']')?; Ok(Type::Vector(n))
+            if self.symbol(',') {
+                let m = match self.bump() { Token::Number(x) if x >= 1.0 && x <= 4096.0 && x.fract() == 0.0 => x as usize, _ => return Err("matrix dimension must be an integer from 1 to 4096".into()) };
+                if n * m > 4096 { return Err("tensor exceeds 4096 elements".into()); }
+                self.expect(']')?; Ok(Type::Matrix(n, m))
+            } else { self.expect(']')?; Ok(Type::Vector(n)) }
         } else { Ok(Type::F32) }
     }
     pub fn program(&mut self) -> Result<Program, String> {
@@ -63,7 +67,7 @@ impl Parser {
             t => return Err(format!("unexpected token in expression: {t:?}")),
         };
         loop {
-            let (op, prec) = match self.peek() { Token::Sym('+') => ('+', 1), Token::Sym('-') => ('-', 1), Token::Sym('*') => ('*', 3), Token::Sym('/') => ('/', 3), _ => break };
+            let (op, prec) = match self.peek() { Token::Sym('+') => ('+', 1), Token::Sym('-') => ('-', 1), Token::Sym('*') => ('*', 3), Token::Sym('@') => ('@', 3), Token::Sym('/') => ('/', 3), _ => break };
             if prec < min_prec { break; }
             self.bump(); let rhs = self.expr(prec + 1)?;
             lhs = Expr::Binary(Box::new(lhs), op, Box::new(rhs));
@@ -81,4 +85,15 @@ mod tests {
         assert!(matches!(&p.functions[0].body[0], Stmt::Let(_, Expr::Binary(_, '+', _))));
     }
     #[test] fn reject_incomplete() { assert!(Parser::new(lex("fn main() { return 1;").unwrap()).program().is_err()); }
+}
+
+#[cfg(test)]
+mod tensor_tests {
+    use super::*;
+    use crate::lexer::lex;
+    #[test] fn matrix_type_and_at() {
+        let p=Parser::new(lex("fn f(x: f32[2,3]) -> f32[2,3] { return x; } fn main() { let y = [[1,2],[3,4]] @ [[1,0],[0,1]]; }").unwrap()).program().unwrap();
+        assert_eq!(p.functions[0].params[0].1, Type::Matrix(2,3));
+        assert!(matches!(p.functions[1].body[0],Stmt::Let(_,Expr::Binary(_, '@', _))));
+    }
 }

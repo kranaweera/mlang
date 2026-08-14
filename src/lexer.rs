@@ -33,7 +33,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
             if !n.is_finite() { return Err("non-finite float literal".into()); }
             out.push(Token::Number(n)); continue;
         }
-        if "(){}[],:;=+-*/".contains(c) { out.push(Token::Sym(c)); pos += 1; continue; }
+        if "(){}[],:;=+-*/@".contains(c) { out.push(Token::Sym(c)); pos += 1; continue; }
         return Err(format!("unexpected character '{c}' at character {}", pos + 1));
     }
     out.push(Token::Eof); Ok(out)
@@ -45,5 +45,5 @@ mod tests {
     #[test] fn comments_and_arrow() {
         assert_eq!(lex("fn test() -> f32 { // hi\n return 2.5; }").unwrap().iter().filter(|t| **t == Token::Arrow).count(), 1);
     }
-    #[test] fn invalid_character() { assert!(lex("@wow").is_err()); }
+    #[test] fn invalid_character() { assert!(lex("$wow").is_err()); }
 }
