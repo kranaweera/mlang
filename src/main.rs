@@ -42,7 +42,7 @@ fn run() -> Result<(), String> {
     let c_path = emit_c.unwrap_or_else(|| out_path.with_extension("c"));
     fs::write(&c_path, c).map_err(|e| format!("cannot write {}: {e}", c_path.display()))?;
     let result = Command::new(&cc).arg("-std=c11").arg("-O2").arg("-Wall").arg("-Wextra")
-        .arg(&c_path).arg("-o").arg(&out_path).status().map_err(|e| format!("cannot execute compiler '{cc}': {e}"))?;
+        .arg(&c_path).arg("-o").arg(&out_path).arg("-lm").status().map_err(|e| format!("cannot execute compiler '{cc}': {e}"))?;
     if !result.success() { return Err(format!("C compiler returned {result}")); }
     println!("Built {} (C source: {})", out_path.display(), c_path.display());
     Ok(())
