@@ -1,63 +1,58 @@
-# MLang v0.1 — Milestone 1
+# MLang v0.2 — Milestone 2 (CPU Tensor Engine)
 
-A tiny, dependency-free **Rust compiler** for a small, statically typed ML-oriented language. It generates C11 source code and invokes Clang to produce a native executable. The generated program does **not** require Rust, Python, PyTorch or TensorFlow.
+MLang is an experimental dependency-free Rust compiler that emits C11 and builds a small native executable with Clang. Deployed programs require no Python, PyTorch, TensorFlow, or Rust installation. macOS Apple Silicon is the primary development target.
 
-**Status:** first prototype. CPU only. CUDA is intentionally **not implemented** yet; passing `--target cuda` emits a clear error instead of silently compiling for CPU. The compiler is not production-hardened.
-
-## Requirements on macOS
-
-1. Install Rust using [rustup](https://rustup.rs/) (includes `cargo`).
-2. Install Apple's Command Line Tools: `xcode-select --install` (provides `clang`).
-3. Check `cargo --version` and `clang --version`.
-
-No external Rust crates are used.
-
-## Build
+## Setup and test
 
 ```sh
-cargo build --release
+source "$HOME/.cargo/env"
 cargo test
-./target/release/mlang build examples/hello.ml --output hello
-./hello
-./target/release/mlang build examples/linear_regression.ml --output predictor --emit-c predictor.c
-./predictor
+cargo build --release
+./target/release/mlang build examples/matmul.ml --output matmul
+./matmul
+./target/release/mlang build examples/tensor_ops.ml --output tensor_ops
+./tensor_ops
+./target/release/mlang build examples/matvec.ml --output matvec
+./matvec
+ls -lh matmul tensor_ops matvec
 ```
 
-Expected outputs: `14` and `18` respectively.
+Expected results:
 
-You can also run via Cargo:
+- `matmul`: `[[19, 22], [43, 50]]`
+- `tensor_ops`: `[[4, 8], [10, 4]]` and `[0.5, 0.5]`
+- `matvec`: `[17, 39]`
+- `linear_regression`: `18` (backward compatible with milestone 1)
 
-```sh
-cargo run -- build examples/linear_regression.ml --output predictor
-```
+## Implemented in this milestone
 
-## Supported language (v0.1)
+- Numeric `f32`, 1D `f32[N]`, and 2D `f32[R,C]` tensors.
+- Nested fixed-size matrix literals, e.g. `[[1,2],[3,4]]`.
+- `+`, `-`, `*`, `/` element-wise for equal-shaped tensors; scalar arithmetic remains available. No implicit broadcasting.
+- `@` matrix–matrix and matrix–vector multiplication.
+- `dot(vector, vector)` unchanged.
+- `relu(tensor)` and `sigmoid(tensor)` for scalars, vectors or matrices.
+- `print` supports scalars, vectors and matrices.
+- Compile-time shape validation and ragged-literal rejection.
+- Contiguous stack-allocated C structs for tensors; specialized loops are emitted only for operators actually used by a program.
+- User-defined functions may accept and return fixed-size tensors.
+- Zero third-party Rust crates.
 
-- `fn name(args...) -> f32 { ... }` functions; `main()` with no return type
-- `let variable = expression;` local bindings
-- `return expression;`
-- `f32` scalar and fixed-size `f32[N]` vectors as function parameters
-- vector literals `[1.0, 2.0]` (maximum 4096 elements)
-- arithmetic `+ - * /`, unary `-`, parentheses
-- `dot(vec, vec)` and `print(scalar)`
-- `//` line comments
-- semicolons are required
-
-Important limitations: this release does **not** train models, read CSV files, perform matrix multiplication, support mutable variables or conditional execution, support strings or tensor shapes beyond one dimension, or emit CUDA code. Only scalar arithmetic is allowed outside `dot()`. Printed values have up to 9 significant digits. The parser accepts a function name that is a C keyword because all generated names are prefixed with `ml_`. Operations use native `float` and may have ordinary floating-point rounding error.
-
-## Examples
+Example:
 
 ```ml
-fn predict(x: f32[3]) -> f32 {
-    let weights = [0.5, 0.3, 0.2];
-    let bias = 1.0;
-    return dot(x, weights) + bias;
-}
-
 fn main() {
-    print(predict([10.0, 20.0, 30.0]));
+    let A = [[1.0, 2.0], [3.0, 4.0]];
+    let B = [[5.0, 6.0], [7.0, 8.0]];
+    print(A @ B);
 }
 ```
+
+## Known limitations
+
+This is still a tiny prototype. The element-count limit is 4096 per tensor; only rank 1–2 is supported. No dynamic dimensions, broadcasting, slicing, loading models, automatic differentiation, training, BLAS, allocation planner or GPU execution. Generated C uses simple triple-loop matrix multiplication, which is not yet optimized for large tensors. Tensor expressions are values passed via C structs and can be copied. `sigmoid` uses C math library (`-lm`). CUDA remains a deliberately unsupported planned backend (`--target cuda`).
+
+Important: despite the original Milestone 2 ambition, **this version does not yet implement a standalone typed IR**; the AST is type-checked and emitted directly as C. A typed, device-independent IR and explicit buffer planning are required before adding CUDA. This scope keeps the initial tensor implementation small and easier to validate.
 
 ## CLI
 
@@ -65,26 +60,13 @@ fn main() {
 mlang build <file.ml> [--output <binary>] [--emit-c <file.c>] [--cc <compiler>] [--target cpu|cuda]
 ```
 
-Default output is `a.out`, target `cpu`, and C compiler `clang`. The generated C is preserved as `<output>.c` unless another path is given using `--emit-c`.
+The existing `examples/hello.ml`, `examples/linear_regression.ml` and Milestone 1 tests remain included.
 
-## Architecture
+## CUDA roadmap
 
-```text
-src/lexer.rs        text -> tokens
-src/parser.rs       tokens -> AST
-src/ast.rs          AST node definitions
-src/semantic.rs     name resolution and type checks
-src/backend/cpu.rs  AST -> C11
-src/backend/cuda.rs planned future implementation (not executable)
-src/main.rs         CLI and native C compilation
-```
+1. Lower type-checked operations to a device-neutral tensor IR.
+2. Define a backend interface for CPU and NVIDIA GPU implementations.
+3. Add PTX generation and CUDA Driver API host stubs, with explicit backend errors.
+4. Validate all operators and numerical tolerances against the CPU reference.
 
-**Next architectural improvement:** introduce a typed, device-neutral IR between semantic analysis and the backends, then add constant folding, tensor operators, shape validation and memory planning before attempting PTX/CUDA. A C host runtime for CUDA will use the NVIDIA Driver API, with GPU code linked/loaded separately. Inference-first; training and autodiff are later milestones.
-
-## Tests
-
-`cargo test` runs lexer/parser/semantic unit tests plus integration tests that use Clang to build and execute two sample programs and verify that a mismatched `dot` is rejected. `clang` must be on PATH.
-
-## Security and support
-
-Generated C should be treated as a build artifact. Do not compile untrusted MLang programs in a privileged environment; the compiler prototype has not been fuzzed or security audited.
+Only the CPU backend is executable today. Do not compile untrusted source in a privileged environment; this compiler has not undergone security review or fuzzing.
