@@ -1,6 +1,7 @@
 mod ast;
 mod backend;
 mod lexer;
+mod ir;
 mod parser;
 mod semantic;
 
@@ -9,8 +10,8 @@ use std::{env, fs, path::PathBuf, process::Command};
 fn compile(source: &str) -> Result<String, String> {
     let tokens = lexer::lex(source)?;
     let ast = parser::Parser::new(tokens).program()?;
-    semantic::check(&ast)?;
-    Ok(backend::cpu::emit_c(&ast))
+    let ir = ir::lower(&ast)?;
+    Ok(backend::cpu::emit_c(&ir))
 }
 
 fn run() -> Result<(), String> {
