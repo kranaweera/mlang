@@ -10,7 +10,7 @@ use std::{env, fs, path::PathBuf, process::Command};
 fn compile(source: &str) -> Result<String, String> {
     let tokens = lexer::lex(source)?;
     let ast = parser::Parser::new(tokens).program()?;
-    let ir = ir::lower(&ast)?;
+    let ir = ir::optimize(ir::lower(&ast)?);
     Ok(backend::cpu::emit_c(&ir))
 }
 

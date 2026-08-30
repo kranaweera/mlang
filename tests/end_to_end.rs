@@ -56,3 +56,5 @@ fn build_and_check_text(example: &str, expected: &str) {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("shape mismatch"));
 }
+
+#[test] fn scalar_constant_folding() { build_and_check_text("constant_folding.ml", "14"); }

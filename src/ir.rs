@@ -54,6 +54,44 @@ pub fn lower(program: &ast::Program) -> Result<Module,String> {
     Ok(Module{functions})
 }
 
+/// Fold scalar literal arithmetic. IEEE-754 result is evaluated at compile time;
+/// divide by zero is left to the runtime to retain existing behavior.
+pub fn fold_expr(expr: Expr) -> Expr {
+    let ty=expr.ty;
+    let kind=match expr.kind {
+        ExprKind::Tensor(xs)=>ExprKind::Tensor(xs.into_iter().map(fold_expr).collect()),
+        ExprKind::Neg(x)=>{
+            let x=fold_expr(*x);
+            if ty==Type::F32 {if let ExprKind::Constant(v)=&x.kind {return Expr{ty,kind:ExprKind::Constant(-*v)};}}
+            ExprKind::Neg(Box::new(x))
+        },
+        ExprKind::Binary(a,op,b)=>{
+            let a=fold_expr(*a);let b=fold_expr(*b);
+            if ty==Type::F32 {
+                if let (ExprKind::Constant(x),ExprKind::Constant(y))=(&a.kind,&b.kind) {
+                    if !(op=='/' && *y==0.0) {
+                        let v=match op {'+'=>Some(x+y),'-'=>Some(x-y),'*'=>Some(x*y),'/'=>Some(x/y),_=>None};
+                        if let Some(v)=v {return Expr{ty,kind:ExprKind::Constant(v)};}
+                    }
+                }
+            }
+            ExprKind::Binary(Box::new(a),op,Box::new(b))
+        },
+        ExprKind::Call(n,xs)=>ExprKind::Call(n,xs.into_iter().map(fold_expr).collect()),
+        other=>other,
+    };
+    Expr{ty,kind}
+}
+pub fn optimize(module: Module) -> Module {
+    Module {functions:module.functions.into_iter().map(|mut f|{
+        f.body=f.body.into_iter().map(|s|match s {
+            Statement::Let(n,e)=>Statement::Let(n,fold_expr(e)),
+            Statement::Return(e)=>Statement::Return(fold_expr(e)),
+            Statement::Evaluate(e)=>Statement::Evaluate(fold_expr(e)),
+            Statement::Print(e)=>Statement::Print(fold_expr(e)),
+        }).collect();f
+    }).collect()}
+}
 /// Compatibility lowering for the existing stable C emitter; all checks and
 /// optimizations have already happened in the typed IR.
 fn to_ast_expr(e:&Expr)->ast::Expr {match &e.kind {
@@ -74,4 +112,16 @@ pub fn to_ast(module:&Module)->ast::Program {
             Statement::Print(e)=>ast::Stmt::Expr(ast::Expr::Call("print".into(),vec![to_ast_expr(e)])),
         }).collect(),
     }).collect()}
+}
+
+#[cfg(test)] mod tests {
+    use super::*;
+    #[test] fn folds_scalar_constants() {
+        let e=Expr{ty:Type::F32,kind:ExprKind::Binary(Box::new(Expr{ty:Type::F32,kind:ExprKind::Constant(2.)}),'+',Box::new(Expr{ty:Type::F32,kind:ExprKind::Constant(3.)}))};
+        assert_eq!(fold_expr(e).kind,ExprKind::Constant(5.));
+    }
+    #[test] fn keeps_division_by_zero() {
+        let e=Expr{ty:Type::F32,kind:ExprKind::Binary(Box::new(Expr{ty:Type::F32,kind:ExprKind::Constant(2.)}),'/',Box::new(Expr{ty:Type::F32,kind:ExprKind::Constant(0.)}))};
+        assert!(matches!(fold_expr(e).kind,ExprKind::Binary(..)));
+    }
 }
