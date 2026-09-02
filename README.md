@@ -70,3 +70,34 @@ The existing `examples/hello.ml`, `examples/linear_regression.ml` and Milestone 
 4. Validate all operators and numerical tolerances against the CPU reference.
 
 Only the CPU backend is executable today. Do not compile untrusted source in a privileged environment; this compiler has not undergone security review or fuzzing.
+
+## Milestone 3: typed intermediate representation
+
+The compiler now follows `source -> AST -> semantic validation -> typed IR ->
+scalar constant folding -> CPU backend -> C -> native binary`.
+
+- `src/ir.rs` contains backend-independent expressions and statements carrying
+  inferred tensor shapes/types. The IR has separate `Print` instructions.
+- The CPU backend receives a typed IR module and converts its optimized nodes
+  to the previously tested C generator's representation. This compatibility
+  bridge is temporary: the emitter still relies on the original AST-based
+  helper generator internally. A dedicated IR-to-C emitter is future work.
+- Unused tensor print helper functions are no longer emitted.
+- CUDA remains an explicit unsupported backend. No GPU code is generated.
+- Scalar constant expressions are folded; tensor fusion is **not** implemented.
+- The package version is 0.3.0.
+
+On macOS run:
+
+```sh
+cargo test
+cargo build --release
+./target/release/mlang build examples/matmul.ml --output matmul
+./matmul
+./scripts/benchmark.sh
+```
+
+`benchmark-out/results.csv` records executable file sizes and approximate
+single-run wall-clock durations. The timings include process startup and are
+not representative of high-resolution inference latency. Run repeated and
+warmed microbenchmarks before making performance claims.
