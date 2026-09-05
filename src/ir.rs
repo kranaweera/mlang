@@ -92,28 +92,6 @@ pub fn optimize(module: Module) -> Module {
         }).collect();f
     }).collect()}
 }
-/// Compatibility lowering for the existing stable C emitter; all checks and
-/// optimizations have already happened in the typed IR.
-fn to_ast_expr(e:&Expr)->ast::Expr {match &e.kind {
-    ExprKind::Constant(v)=>ast::Expr::Number(*v),
-    ExprKind::Variable(n)=>ast::Expr::Var(n.clone()),
-    ExprKind::Tensor(xs)=>ast::Expr::Vector(xs.iter().map(to_ast_expr).collect()),
-    ExprKind::Neg(x)=>ast::Expr::UnaryMinus(Box::new(to_ast_expr(x))),
-    ExprKind::Binary(a,o,b)=>ast::Expr::Binary(Box::new(to_ast_expr(a)),*o,Box::new(to_ast_expr(b))),
-    ExprKind::Call(n,xs)=>ast::Expr::Call(n.clone(),xs.iter().map(to_ast_expr).collect()),
-}}
-pub fn to_ast(module:&Module)->ast::Program {
-    ast::Program {functions:module.functions.iter().map(|f|ast::Function {
-        name:f.name.clone(),params:f.params.clone(),result:f.result.clone(),
-        body:f.body.iter().map(|s|match s {
-            Statement::Let(n,e)=>ast::Stmt::Let(n.clone(),to_ast_expr(e)),
-            Statement::Return(e)=>ast::Stmt::Return(to_ast_expr(e)),
-            Statement::Evaluate(e)=>ast::Stmt::Expr(to_ast_expr(e)),
-            Statement::Print(e)=>ast::Stmt::Expr(ast::Expr::Call("print".into(),vec![to_ast_expr(e)])),
-        }).collect(),
-    }).collect()}
-}
-
 #[cfg(test)] mod tests {
     use super::*;
     #[test] fn folds_scalar_constants() {

@@ -1,56 +1,34 @@
-use crate::ast::{Expr, Program, Stmt, Type};
-use crate::semantic::infer;
-use std::collections::{BTreeSet, HashMap};
+//! Native C emission directly from the typed IR (no IR -> AST conversion).
+use crate::ast::Type;
+use crate::ir::{Expr, ExprKind, Module, Statement};
+use std::collections::BTreeSet;
 
-type Sigs = HashMap<String,(Vec<Type>,Option<Type>)>;
 fn tag(t: &Type) -> String { match t { Type::F32 => "f32".into(), Type::Vector(n)=>format!("v{n}"),Type::Matrix(r,c)=>format!("m{r}_{c}") } }
 fn ctype(t: &Type) -> String { if *t==Type::F32 { "float".into() } else { format!("ml_{}",tag(t)) } }
 fn count(t: &Type)->usize { match t { Type::F32=>1,Type::Vector(n)=>*n,Type::Matrix(r,c)=>r*c } }
 fn shape(t: &Type)->(usize,usize) { match t { Type::F32=>(1,1),Type::Vector(n)=>(1,*n),Type::Matrix(r,c)=>(*r,*c) } }
-fn expr(e: &Expr, vars: &HashMap<String,Type>, sigs: &Sigs) -> String {
-    match e {
-        Expr::Number(n)=>format!("{n:.9}f"), Expr::Var(name)=>format!("ml_{name}"),
-        Expr::Vector(xs)=> {
-            let ty=infer(e,vars,sigs).expect("validated AST");
-            let mut flat=Vec::new();
-            fn flatten(x:&Expr,out:&mut Vec<Expr>) { match x { Expr::Vector(ys)=>for y in ys {flatten(y,out)}, _=>out.push(x.clone()) } }
-            for x in xs { flatten(x,&mut flat); }
-            format!("({}){{{{{}}}}}",ctype(&ty),flat.iter().map(|x|expr(x,vars,sigs)).collect::<Vec<_>>().join(", "))
-        }
-        Expr::UnaryMinus(x)=> { let ty=infer(x,vars,sigs).unwrap(); if ty==Type::F32 {format!("(-{})",expr(x,vars,sigs))} else {format!("ml_neg_{}({})",tag(&ty),expr(x,vars,sigs))} }
-        Expr::Binary(a,op,b)=> {
-            let lt=infer(a,vars,sigs).unwrap(); let rt=infer(b,vars,sigs).unwrap();
-            if *op=='@' { format!("ml_matmul_{}_{}({}, {})",tag(&lt),tag(&rt),expr(a,vars,sigs),expr(b,vars,sigs)) }
-            else if lt==Type::F32 {format!("({} {op} {})",expr(a,vars,sigs),expr(b,vars,sigs))}
-            else { let opname=match op {'+'=>"add",'-'=>"sub",'*'=>"mul",'/'=>"div",_=>unreachable!()};format!("ml_{opname}_{}({}, {})",tag(&lt),expr(a,vars,sigs),expr(b,vars,sigs)) }
-        }
-        Expr::Call(name,args)=> {
-            let rendered=args.iter().map(|x|expr(x,vars,sigs)).collect::<Vec<_>>().join(", ");
-            match name.as_str() {
-                "dot"=>format!("ml_dot_{}({rendered})",tag(&infer(&args[0],vars,sigs).unwrap())),
-                "relu"|"sigmoid"=>format!("ml_{name}_{}({rendered})",tag(&infer(&args[0],vars,sigs).unwrap())),
-                _=>format!("ml_{name}({rendered})"),
-            }
-        }
-    }
+fn expr(e:&Expr)->String {
+ match &e.kind {
+  ExprKind::Constant(n)=>format!("{n:.9}f"),
+  ExprKind::Variable(n)=>format!("ml_{n}"),
+  ExprKind::Tensor(xs)=>{
+   fn flatten(xs:&[Expr],out:&mut Vec<String>){for x in xs {if let ExprKind::Tensor(inner)=&x.kind {flatten(inner,out)} else {out.push(expr(x));}}}
+   let mut flat=Vec::new();flatten(xs,&mut flat);
+   format!("({}){{{{{}}}}}",ctype(&e.ty),flat.join(", "))
+  }
+  ExprKind::Neg(x)=>if e.ty==Type::F32 {format!("(-{})",expr(x))} else {format!("ml_neg_{}({})",tag(&e.ty),expr(x))},
+  ExprKind::Binary(a,op,b)=>if *op=='@' {format!("ml_matmul_{}_{}({}, {})",tag(&a.ty),tag(&b.ty),expr(a),expr(b))} else if e.ty==Type::F32 {format!("({} {op} {})",expr(a),expr(b))} else {let opname=match op {'+'=>"add",'-'=>"sub",'*'=>"mul",'/'=>"div",_=>unreachable!()};format!("ml_{opname}_{}({}, {})",tag(&e.ty),expr(a),expr(b))},
+  ExprKind::Call(n,args)=>{let rendered=args.iter().map(expr).collect::<Vec<_>>().join(", ");match n.as_str(){"dot"=>format!("ml_dot_{}({rendered})",tag(&args[0].ty)),"relu"|"sigmoid"=>format!("ml_{n}_{}({rendered})",tag(&args[0].ty)),_=>format!("ml_{n}({rendered})")}}
+ }
 }
-fn gather(e:&Expr,vars:&HashMap<String,Type>,sigs:&Sigs,types:&mut BTreeSet<Type>,ops:&mut BTreeSet<String>) {
-    let t=infer(e,vars,sigs).expect("validated AST"); types.insert(t.clone());
-    match e {
-        Expr::Vector(xs)=>for x in xs {gather(x,vars,sigs,types,ops)},
-        Expr::UnaryMinus(x)=> {gather(x,vars,sigs,types,ops);let xt=infer(x,vars,sigs).unwrap();if xt!=Type::F32 {ops.insert(format!("neg:{}",tag(&xt)));} },
-        Expr::Binary(a,op,b)=> {
-            gather(a,vars,sigs,types,ops);gather(b,vars,sigs,types,ops);
-            let lt=infer(a,vars,sigs).unwrap();let rt=infer(b,vars,sigs).unwrap();
-            if *op=='@' {ops.insert(format!("matmul:{}:{}",tag(&lt),tag(&rt)));}
-            else if lt!=Type::F32 {ops.insert(format!("{}:{}",match op {'+'=>"add",'-'=>"sub",'*'=>"mul",'/'=>"div",_=>unreachable!()},tag(&lt)));}
-        }
-        Expr::Call(name,args)=> {
-            for x in args {gather(x,vars,sigs,types,ops);}
-            if ["relu","sigmoid","dot"].contains(&name.as_str()) {let t=infer(&args[0],vars,sigs).unwrap();ops.insert(format!("{name}:{}",tag(&t)));}
-        }
-        _=>{}
-    }
+fn gather(e:&Expr,types:&mut BTreeSet<Type>,ops:&mut BTreeSet<String>) {
+ types.insert(e.ty.clone());match &e.kind {
+  ExprKind::Tensor(xs)=>for x in xs {gather(x,types,ops)},
+  ExprKind::Neg(x)=>{gather(x,types,ops);if x.ty!=Type::F32 {ops.insert(format!("neg:{}",tag(&x.ty)));}},
+  ExprKind::Binary(a,op,b)=>{gather(a,types,ops);gather(b,types,ops);if *op=='@' {ops.insert(format!("matmul:{}:{}",tag(&a.ty),tag(&b.ty)));}else if e.ty!=Type::F32 {ops.insert(format!("{}:{}",match op {'+'=>"add",'-'=>"sub",'*'=>"mul",'/'=>"div",_=>unreachable!()},tag(&e.ty)));}},
+  ExprKind::Call(n,args)=>{for a in args {gather(a,types,ops);}if ["relu","sigmoid","dot"].contains(&n.as_str()){ops.insert(format!("{n}:{}",tag(&args[0].ty)));}},
+  _=>{}
+ }
 }
 fn find_type<'a>(types:&'a BTreeSet<Type>,tag_name:&str)->&'a Type {types.iter().find(|t|tag(t)==tag_name).expect("collected type")}
 fn helpers(types:&BTreeSet<Type>,ops:&BTreeSet<String>,printed:&BTreeSet<Type>)->String {
@@ -95,37 +73,32 @@ fn helpers(types:&BTreeSet<Type>,ops:&BTreeSet<String>,printed:&BTreeSet<Type>)-
     }
     out
 }
-pub fn emit_c(module:&crate::ir::Module)->String {
-    let program = &crate::ir::to_ast(module);
-    let sigs:Sigs=program.functions.iter().map(|f|(f.name.clone(),(f.params.iter().map(|(_,t)|t.clone()).collect(),f.result.clone()))).collect();
-    let mut types=BTreeSet::new();let mut ops=BTreeSet::new();let mut printed=BTreeSet::new();
-    for f in &program.functions {
-        let mut vars:HashMap<String,Type>=f.params.iter().cloned().collect();
-        for (_,t) in &f.params {types.insert(t.clone());}
-        if let Some(t)=&f.result {types.insert(t.clone());}
-        for stmt in &f.body {let e=match stmt {Stmt::Let(_,e)|Stmt::Return(e)|Stmt::Expr(e)=>e};
-            if let Stmt::Expr(Expr::Call(name,args))=stmt {if name=="print" {printed.insert(infer(&args[0],&vars,&sigs).unwrap());gather(&args[0],&vars,&sigs,&mut types,&mut ops);continue;}}
-            gather(e,&vars,&sigs,&mut types,&mut ops);
-            if let Stmt::Let(name,e)=stmt {vars.insert(name.clone(),infer(e,&vars,&sigs).unwrap());}
-        }
-    }
-    let mut out=String::from("/* Generated by MLang v0.3 typed IR backend. */\n#include <stdio.h>\n#include <stddef.h>\n#include <math.h>\n\n");
-    out.push_str(&helpers(&types,&ops,&printed));out.push('\n');
-    for f in &program.functions {if f.name=="main" {continue;}let params=f.params.iter().map(|(n,t)|format!("{} ml_{n}",ctype(t))).collect::<Vec<_>>().join(", ");out.push_str(&format!("{} ml_{}({});\n",f.result.as_ref().map(ctype).unwrap_or("void".into()),f.name,if params.is_empty(){"void"}else{&params}));}
-    for f in &program.functions {
-        let main=f.name=="main";let name=if main {"main".into()}else{format!("ml_{}",f.name)};
-        let ret=if main {"int".into()}else{f.result.as_ref().map(ctype).unwrap_or("void".into())};
-        let params=f.params.iter().map(|(n,t)|format!("{} ml_{n}",ctype(t))).collect::<Vec<_>>().join(", ");
-        out.push_str(&format!("{ret} {name}({}) {{\n",if params.is_empty(){"void"}else{&params}));
-        let mut vars:HashMap<String,Type>=f.params.iter().cloned().collect();
-        for stmt in &f.body {match stmt {
-            Stmt::Let(n,e)=>{let ty=infer(e,&vars,&sigs).unwrap();out.push_str(&format!("  {} ml_{n} = {};\n",ctype(&ty),expr(e,&vars,&sigs)));vars.insert(n.clone(),ty);}
-            Stmt::Return(e)=>out.push_str(&format!("  return {};\n",expr(e,&vars,&sigs))),
-            Stmt::Expr(Expr::Call(n,args)) if n=="print"=>{let e=&args[0];let ty=infer(e,&vars,&sigs).unwrap();if ty==Type::F32 {out.push_str(&format!("  printf(\"%.9g\\n\",(double)({}));\n",expr(e,&vars,&sigs)));}else{out.push_str(&format!("  ml_print_{}({});\n",tag(&ty),expr(e,&vars,&sigs)));}}
-            Stmt::Expr(e)=>out.push_str(&format!("  (void)({});\n",expr(e,&vars,&sigs))),
-        }}
-        if main {out.push_str("  return 0;\n");}
-        out.push_str("}\n\n");
-    }
-    out
+pub fn emit_c(module:&Module)->String {
+ let mut types=BTreeSet::new();let mut ops=BTreeSet::new();let mut printed=BTreeSet::new();
+ for f in &module.functions {
+  for (_,t) in &f.params {types.insert(t.clone());}
+  if let Some(t)=&f.result {types.insert(t.clone());}
+  for stmt in &f.body {match stmt {
+   Statement::Let(_,e)|Statement::Return(e)|Statement::Evaluate(e)=>gather(e,&mut types,&mut ops),
+   Statement::Print(e)=>{printed.insert(e.ty.clone());gather(e,&mut types,&mut ops);}
+  }}
+ }
+ let mut out=String::from("/* Generated by MLang v0.4 direct typed IR backend. */\n#include <stdio.h>\n#include <stddef.h>\n#include <math.h>\n\n");
+ out.push_str(&helpers(&types,&ops,&printed));out.push('\n');
+ for f in &module.functions {if f.name=="main" {continue;}let params=f.params.iter().map(|(n,t)|format!("{} ml_{n}",ctype(t))).collect::<Vec<_>>().join(", ");out.push_str(&format!("{} ml_{}({});\n",f.result.as_ref().map(ctype).unwrap_or("void".into()),f.name,if params.is_empty(){"void"}else{&params}));}
+ for f in &module.functions {
+  let is_main=f.name=="main";let name=if is_main {"main".into()}else{format!("ml_{}",f.name)};
+  let ret=if is_main {"int".into()}else{f.result.as_ref().map(ctype).unwrap_or("void".into())};
+  let params=f.params.iter().map(|(n,t)|format!("{} ml_{n}",ctype(t))).collect::<Vec<_>>().join(", ");
+  out.push_str(&format!("{ret} {name}({}) {{\n",if params.is_empty(){"void"}else{&params}));
+  for stmt in &f.body {match stmt {
+   Statement::Let(n,e)=>out.push_str(&format!("  {} ml_{n} = {};\n",ctype(&e.ty),expr(e))),
+   Statement::Return(e)=>out.push_str(&format!("  return {};\n",expr(e))),
+   Statement::Print(e)=>if e.ty==Type::F32 {out.push_str(&format!("  printf(\"%.9g\\n\",(double)({}));\n",expr(e)));}else{out.push_str(&format!("  ml_print_{}({});\n",tag(&e.ty),expr(e)));},
+   Statement::Evaluate(e)=>out.push_str(&format!("  (void)({});\n",expr(e))),
+  }}
+  if is_main {out.push_str("  return 0;\n");}
+  out.push_str("}\n\n");
+ }
+ out
 }
