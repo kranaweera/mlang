@@ -58,3 +58,5 @@ fn build_and_check_text(example: &str, expected: &str) {
 }
 
 #[test] fn scalar_constant_folding() { build_and_check_text("constant_folding.ml", "14"); }
+
+#[test] fn embedded_neural_network() { build_and_check_text("neural_embedded.ml", "[5]"); }
