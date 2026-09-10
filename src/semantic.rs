@@ -31,6 +31,22 @@ pub fn infer(expr: &Expr, vars: &HashMap<String, Type>, sigs: &Signatures) -> Re
         Expr::Call(name, args) => {
             let types = args.iter().map(|x| infer(x,vars,sigs)).collect::<Result<Vec<_>,_>>()?;
             match name.as_str() {
+                _ if name.starts_with("read_v") || name.starts_with("read_m") => {
+                    if !args.is_empty() { return Err("read_* takes no arguments".into()); }
+                    let ty = if let Some(n)=name.strip_prefix("read_v") {
+                        let n=n.parse::<usize>().map_err(|_| "invalid read_v dimension")?;
+                        Type::Vector(n)
+                    } else {
+                        let dims=name.strip_prefix("read_m").unwrap().split('_').collect::<Vec<_>>();
+                        if dims.len()!=2 { return Err("invalid read_m dimensions".into()); }
+                        let r=dims[0].parse::<usize>().map_err(|_| "invalid read_m rows")?;
+                        let c=dims[1].parse::<usize>().map_err(|_| "invalid read_m columns")?;
+                        Type::Matrix(r,c)
+                    };
+                    let elements=match ty {Type::Vector(n)=>n,Type::Matrix(r,c)=>r.checked_mul(c).ok_or("invalid dimensions")?,_=>0};
+                    if elements==0 || elements>4096 {return Err("read tensor must contain 1..4096 elements".into());}
+                    Ok(ty)
+                },
                 "dot" => match types.as_slice() { [Type::Vector(a),Type::Vector(b)] if a==b => Ok(Type::F32), _ => Err("dot expects two vectors of the same length".into()) },
                 "relu" | "sigmoid" => match types.as_slice() { [t] => Ok(t.clone()), _ => Err(format!("{name} requires one argument")) },
                 "print" => Err("print is a statement, not a value".into()),

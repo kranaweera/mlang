@@ -60,3 +60,42 @@ fn build_and_check_text(example: &str, expected: &str) {
 #[test] fn scalar_constant_folding() { build_and_check_text("constant_folding.ml", "14"); }
 
 #[test] fn embedded_neural_network() { build_and_check_text("neural_embedded.ml", "[5]"); }
+#[test] fn external_neural_network() {
+ use std::process::Stdio;
+ use std::io::Write;
+ let compiler=env!("CARGO_BIN_EXE_mlang");
+ let root=PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+ let temp=std::env::temp_dir().join(format!("mlang-external-{}",std::process::id()));
+ std::fs::create_dir_all(&temp).unwrap();let binary=temp.join("model");
+ let built=Command::new(compiler).arg("build").arg(root.join("examples/neural_external.ml")).arg("--output").arg(&binary).output().unwrap();
+ assert!(built.status.success(),"{}",String::from_utf8_lossy(&built.stderr));
+ let mut child=Command::new(&binary).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+ child.stdin.take().unwrap().write_all(std::fs::read(root.join("examples/neural_weights.txt")).unwrap().as_slice()).unwrap();
+ let output=child.wait_with_output().unwrap();assert!(output.status.success());
+ assert_eq!(String::from_utf8(output.stdout).unwrap().trim(),"[5]");
+ let _=std::fs::remove_dir_all(temp);
+}
+
+#[test]
+fn external_neural_network_rejects_bad_weights() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let compiler = env!("CARGO_BIN_EXE_mlang");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp = std::env::temp_dir().join(format!("mlang-invalid-weight-{}", std::process::id()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let binary = temp.join("model");
+    let built = Command::new(compiler).arg("build")
+        .arg(root.join("examples/neural_external.ml"))
+        .arg("--output").arg(&binary).output().unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    for bad_input in ["1.0 2.0", "NaN 0 0 0 0 0 0 0 0 0 0 0 0"] {
+        let mut child = Command::new(&binary).stdin(Stdio::piped())
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(bad_input.as_bytes()).unwrap();
+        let result = child.wait_with_output().unwrap();
+        assert_eq!(result.status.code(), Some(2), "{:?}", result);
+        assert!(String::from_utf8_lossy(&result.stderr).contains("invalid external weight"));
+    }
+    let _ = std::fs::remove_dir_all(temp);
+}
