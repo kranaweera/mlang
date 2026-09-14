@@ -1,103 +1,53 @@
-# MLang v0.2 — Milestone 2 (CPU Tensor Engine)
+# MLang v0.4.1 — Native inference compiler
 
-MLang is an experimental dependency-free Rust compiler that emits C11 and builds a small native executable with Clang. Deployed programs require no Python, PyTorch, TensorFlow, or Rust installation. macOS Apple Silicon is the primary development target.
+Built on Milestone 3. CPU backend now emits C **directly from typed IR** (without IR-to-AST conversion). Includes a small 2→3→1 dense ReLU network using embedded or external weights.
 
-## Setup and test
-
-```sh
-source "$HOME/.cargo/env"
-cargo test
-cargo build --release
-./target/release/mlang build examples/matmul.ml --output matmul
-./matmul
-./target/release/mlang build examples/tensor_ops.ml --output tensor_ops
-./tensor_ops
-./target/release/mlang build examples/matvec.ml --output matvec
-./matvec
-ls -lh matmul tensor_ops matvec
-```
-
-Expected results:
-
-- `matmul`: `[[19, 22], [43, 50]]`
-- `tensor_ops`: `[[4, 8], [10, 4]]` and `[0.5, 0.5]`
-- `matvec`: `[17, 39]`
-- `linear_regression`: `18` (backward compatible with milestone 1)
-
-## Implemented in this milestone
-
-- Numeric `f32`, 1D `f32[N]`, and 2D `f32[R,C]` tensors.
-- Nested fixed-size matrix literals, e.g. `[[1,2],[3,4]]`.
-- `+`, `-`, `*`, `/` element-wise for equal-shaped tensors; scalar arithmetic remains available. No implicit broadcasting.
-- `@` matrix–matrix and matrix–vector multiplication.
-- `dot(vector, vector)` unchanged.
-- `relu(tensor)` and `sigmoid(tensor)` for scalars, vectors or matrices.
-- `print` supports scalars, vectors and matrices.
-- Compile-time shape validation and ragged-literal rejection.
-- Contiguous stack-allocated C structs for tensors; specialized loops are emitted only for operators actually used by a program.
-- User-defined functions may accept and return fixed-size tensors.
-- Zero third-party Rust crates.
-
-Example:
-
-```ml
-fn main() {
-    let A = [[1.0, 2.0], [3.0, 4.0]];
-    let B = [[5.0, 6.0], [7.0, 8.0]];
-    print(A @ B);
-}
-```
-
-## Known limitations
-
-This is still a tiny prototype. The element-count limit is 4096 per tensor; only rank 1–2 is supported. No dynamic dimensions, broadcasting, slicing, loading models, automatic differentiation, training, BLAS, allocation planner or GPU execution. Generated C uses simple triple-loop matrix multiplication, which is not yet optimized for large tensors. Tensor expressions are values passed via C structs and can be copied. `sigmoid` uses C math library (`-lm`). CUDA remains a deliberately unsupported planned backend (`--target cuda`).
-
-Important: despite the original Milestone 2 ambition, **this version does not yet implement a standalone typed IR**; the AST is type-checked and emitted directly as C. A typed, device-independent IR and explicit buffer planning are required before adding CUDA. This scope keeps the initial tensor implementation small and easier to validate.
-
-## CLI
-
-```text
-mlang build <file.ml> [--output <binary>] [--emit-c <file.c>] [--cc <compiler>] [--target cpu|cuda]
-```
-
-The existing `examples/hello.ml`, `examples/linear_regression.ml` and Milestone 1 tests remain included.
-
-## CUDA roadmap
-
-1. Lower type-checked operations to a device-neutral tensor IR.
-2. Define a backend interface for CPU and NVIDIA GPU implementations.
-3. Add PTX generation and CUDA Driver API host stubs, with explicit backend errors.
-4. Validate all operators and numerical tolerances against the CPU reference.
-
-Only the CPU backend is executable today. Do not compile untrusted source in a privileged environment; this compiler has not undergone security review or fuzzing.
-
-## Milestone 3: typed intermediate representation
-
-The compiler now follows `source -> AST -> semantic validation -> typed IR ->
-scalar constant folding -> CPU backend -> C -> native binary`.
-
-- `src/ir.rs` contains backend-independent expressions and statements carrying
-  inferred tensor shapes/types. The IR has separate `Print` instructions.
-- The CPU backend receives a typed IR module and converts its optimized nodes
-  to the previously tested C generator's representation. This compatibility
-  bridge is temporary: the emitter still relies on the original AST-based
-  helper generator internally. A dedicated IR-to-C emitter is future work.
-- Unused tensor print helper functions are no longer emitted.
-- CUDA remains an explicit unsupported backend. No GPU code is generated.
-- Scalar constant expressions are folded; tensor fusion is **not** implemented.
-- The package version is 0.3.0.
-
-On macOS run:
+## Run on macOS (Rust + Clang)
 
 ```sh
 cargo test
 cargo build --release
-./target/release/mlang build examples/matmul.ml --output matmul
-./matmul
+./target/release/mlang build examples/neural_embedded.ml --output neural_embedded
+./neural_embedded                     # [5]
+./target/release/mlang build examples/neural_external.ml --output neural_external
+./neural_external < examples/neural_weights.txt  # [5]
 ./scripts/benchmark.sh
 ```
 
-`benchmark-out/results.csv` records executable file sizes and approximate
-single-run wall-clock durations. The timings include process startup and are
-not representative of high-resolution inference latency. Run repeated and
-warmed microbenchmarks before making performance claims.
+The external weight format is plain whitespace-separated FP32 decimal numbers, row-major, in `read_*()` invocation order. **The loader uses standard input**, so a weight file is supplied via redirection. Incorrect or truncated input exits with code 2; it is not yet a versioned model format.
+
+## Limitations
+
+* Fixed-shape rank <= 2 FP32 tensors, max 4096 elements, no broadcasting or dynamic allocation.
+* `read_vN()` and `read_mR_C()` read numbers from stdin. They do not implement named-file loading or secure weights validation.
+* Dense network uses existing matmul and ReLU operators, not fused kernels; no autodiff, training, CUDA, or operator fusion yet.
+* Compiler targets macOS/Linux via Clang; no standalone runtime benchmark harness yet beyond process-start wall time.
+* Embedded weights are handwritten numerical examples, not weights produced by a training pipeline.
+
+CUDA remains an intentionally unavailable backend. Binary sizes need measurement on your target system.
+
+## Size comparison
+
+```sh
+./scripts/neural_benchmark.sh
+```
+
+This reports file size and output (not inference-only latency). Compare against the 33 KB Milestone 3 baseline; process-level measurements do not represent isolated model latency.
+
+## Milestone 4 verification (v0.4.1)
+
+Run `./scripts/verify_neural.sh` to execute Rust tests, compile both network
+variants, and compare their outputs to a separate Python standard-library
+reference calculation. Python is **only used for development verification**;
+the compiled inference binary does not depend on Python.
+
+The external-weight loader now rejects truncated, malformed and non-finite
+(`NaN`, `Inf`) values with exit code 2. This is still a prototype stdin
+format, **not** a production-safe model file parser; extra trailing tokens
+are not rejected, and no model versioning, checksums, or authentication exist.
+
+The 2→3→1 network has **hand-chosen illustrative weights**, not weights
+learned by a training algorithm. No training functionality is claimed.
+
+A build/test run on macOS with Cargo and Clang is still required: the
+packaging environment used for this release does not provide Cargo.
