@@ -4,6 +4,7 @@ mod lexer;
 mod ir;
 mod parser;
 mod semantic;
+mod model_import;
 
 use std::{env, fs, path::PathBuf, process::Command};
 
@@ -16,8 +17,20 @@ fn compile(source: &str) -> Result<String, String> {
 
 fn run() -> Result<(), String> {
     let args: Vec<_> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("import") {
+        if args.len() != 4 || args[2] != "--output" {
+            return Err("usage: mlang import <model.mmdl> --output <file.ml>".into());
+        }
+        let model = fs::read_to_string(&args[1]).map_err(|e| format!("cannot read model: {e}"))?;
+        let program = model_import::import(&model)?;
+        // Validate the generated program through the exact same frontend as handwritten MLang.
+        compile(&program)?;
+        fs::write(&args[3], program).map_err(|e| format!("cannot write program: {e}"))?;
+        println!("Imported {} -> {}", args[1], args[3]);
+        return Ok(());
+    }
     if args.is_empty() || args[0] != "build" {
-        return Err("usage: mlang build <file.ml> [--output <binary>] [--emit-c <file.c>] [--cc <compiler>] [--target cpu|cuda]".into());
+        return Err("usage: mlang import <model.mmdl> --output <file.ml> | mlang build <file.ml> [--output <binary>] [--emit-c <file.c>] [--cc <compiler>] [--target cpu|cuda]".into());
     }
     if args.len() < 2 { return Err("missing source file".into()); }
     let source = fs::read_to_string(&args[1]).map_err(|e| format!("cannot read {}: {e}", args[1]))?;
