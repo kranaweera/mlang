@@ -51,3 +51,71 @@ learned by a training algorithm. No training functionality is claimed.
 
 A build/test run on macOS with Cargo and Clang is still required: the
 packaging environment used for this release does not provide Cargo.
+
+## Milestone 5 — portable dense model import (v0.5.0)
+
+MLang now imports a small **data-only** `.mmdl` format and emits ordinary `.ml`
+source that embeds the weights. It supports stacks of dense `f32` layers with
+`relu` or `linear` activations and a maximum of 4,096 elements per tensor.
+This is *not* general ONNX import, arbitrary scikit-learn import, or CUDA.
+
+```sh
+cargo test
+cargo build --release
+./target/release/mlang import examples/sample_model.mmdl --output imported.ml
+./target/release/mlang build imported.ml --output imported
+./imported
+./scripts/verify_import.sh
+```
+
+Expected `./imported`: `[1.5]` for the generated zero input; a second verification
+probe with `[2, 3]` should produce `[5]`.
+
+### Model interchange specification (MLANG-MODEL 1)
+
+```text
+MLANG-MODEL 1
+input 2
+dense 3 relu
+weights 1 0 0 2 -1 1
+bias 0 0 1
+dense 1 linear
+weights 0.5 0.25 1
+bias 0.5
+```
+
+Each dense layer specifies the output width. `weights` has exactly `output * input`
+finite numbers in row-major `(output, input)` order; `bias` contains `output`
+finite numbers. Layers chain in file order. Generated source uses embedded weights;
+no model parser or Python runtime ships in the deployed binary. The generated
+`main` demonstrates inference on a *zero input*; edit it or invoke `predict()`
+with your own input to do useful predictions. No preprocessing/scaling metadata
+is serialized, so apply the same preprocessing as training externally.
+
+### Exporting an existing scikit-learn MLPRegressor
+
+In a separate, trusted training environment where scikit-learn and joblib are
+installed, train an `MLPRegressor` with `activation='relu'` or `'identity'`.
+Save it with `joblib.dump`, then run:
+
+```sh
+python3 tools/export_sklearn_mlp.py trusted_model.joblib model.mmdl
+./target/release/mlang import model.mmdl --output model.ml
+./target/release/mlang build model.ml --output model_native
+```
+
+The exporter handles **only** `MLPRegressor`, not classifiers, and writes the
+matrix transpose required by MLang. Never load untrusted joblib/pickle files.
+For numerical comparison, use the same unscaled/scaled input in both runtimes;
+small differences are expected due to f32 arithmetic. The importer rejects
+invalid widths, missing values, unsupported activations, and non-finite weights.
+
+### Benchmarking
+
+```sh
+ls -lh model_native
+/usr/bin/time -l ./model_native  # macOS
+```
+
+Executable size varies by target and model; the previously measured 33 KB was
+for tiny examples, not a guarantee for imported models. CPU inference only.
