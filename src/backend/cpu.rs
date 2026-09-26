@@ -7,18 +7,18 @@ fn tag(t: &Type) -> String { match t { Type::F32 => "f32".into(), Type::Vector(n
 fn ctype(t: &Type) -> String { if *t==Type::F32 { "float".into() } else { format!("ml_{}",tag(t)) } }
 fn count(t: &Type)->usize { match t { Type::F32=>1,Type::Vector(n)=>*n,Type::Matrix(r,c)=>r*c } }
 fn shape(t: &Type)->(usize,usize) { match t { Type::F32=>(1,1),Type::Vector(n)=>(1,*n),Type::Matrix(r,c)=>(*r,*c) } }
-fn expr(e:&Expr)->String {
+fn expr(e:&Expr, cuda:bool)->String {
  match &e.kind {
   ExprKind::Constant(n)=>format!("{n:.9}f"),
   ExprKind::Variable(n)=>format!("ml_{n}"),
   ExprKind::Tensor(xs)=>{
-   fn flatten(xs:&[Expr],out:&mut Vec<String>){for x in xs {if let ExprKind::Tensor(inner)=&x.kind {flatten(inner,out)} else {out.push(expr(x));}}}
-   let mut flat=Vec::new();flatten(xs,&mut flat);
-   format!("({}){{{{{}}}}}",ctype(&e.ty),flat.join(", "))
+   fn flatten(xs:&[Expr],out:&mut Vec<String>,cuda:bool){for x in xs {if let ExprKind::Tensor(inner)=&x.kind {flatten(inner,out,cuda)} else {out.push(expr(x,cuda));}}}
+   let mut flat=Vec::new();flatten(xs,&mut flat,cuda);
+   if cuda { format!("{}{{{{{}}}}}",ctype(&e.ty),flat.join(", ")) } else { format!("({}){{{{{}}}}}",ctype(&e.ty),flat.join(", ")) }
   }
-  ExprKind::Neg(x)=>if e.ty==Type::F32 {format!("(-{})",expr(x))} else {format!("ml_neg_{}({})",tag(&e.ty),expr(x))},
-  ExprKind::Binary(a,op,b)=>if *op=='@' {format!("ml_matmul_{}_{}({}, {})",tag(&a.ty),tag(&b.ty),expr(a),expr(b))} else if e.ty==Type::F32 {format!("({} {op} {})",expr(a),expr(b))} else {let opname=match op {'+'=>"add",'-'=>"sub",'*'=>"mul",'/'=>"div",_=>unreachable!()};format!("ml_{opname}_{}({}, {})",tag(&e.ty),expr(a),expr(b))},
-  ExprKind::Call(n,args)=>{let rendered=args.iter().map(expr).collect::<Vec<_>>().join(", ");match n.as_str(){"dot"=>format!("ml_dot_{}({rendered})",tag(&args[0].ty)),"relu"|"sigmoid"=>format!("ml_{n}_{}({rendered})",tag(&args[0].ty)),_ if n.starts_with("read_v")||n.starts_with("read_m") =>format!("ml_{n}()"),_=>format!("ml_{n}({rendered})")}}
+  ExprKind::Neg(x)=>if e.ty==Type::F32 {format!("(-{})",expr(x,cuda))} else {format!("ml_neg_{}({})",tag(&e.ty),expr(x,cuda))},
+  ExprKind::Binary(a,op,b)=>if *op=='@' {format!("ml_matmul_{}_{}({}, {})",tag(&a.ty),tag(&b.ty),expr(a,cuda),expr(b,cuda))} else if e.ty==Type::F32 {format!("({} {op} {})",expr(a,cuda),expr(b,cuda))} else {let opname=match op {'+'=>"add",'-'=>"sub",'*'=>"mul",'/'=>"div",_=>unreachable!()};format!("ml_{opname}_{}({}, {})",tag(&e.ty),expr(a,cuda),expr(b,cuda))},
+  ExprKind::Call(n,args)=>{let rendered=args.iter().map(|a|expr(a,cuda)).collect::<Vec<_>>().join(", ");match n.as_str(){"dot"=>format!("ml_dot_{}({rendered})",tag(&args[0].ty)),"relu"|"sigmoid"=>format!("ml_{n}_{}({rendered})",tag(&args[0].ty)),_ if n.starts_with("read_v")||n.starts_with("read_m") =>format!("ml_{n}()"),_=>format!("ml_{n}({rendered})")}}
  }
 }
 fn gather(e:&Expr,types:&mut BTreeSet<Type>,ops:&mut BTreeSet<String>) {
@@ -31,7 +31,7 @@ fn gather(e:&Expr,types:&mut BTreeSet<Type>,ops:&mut BTreeSet<String>) {
  }
 }
 fn find_type<'a>(types:&'a BTreeSet<Type>,tag_name:&str)->&'a Type {types.iter().find(|t|tag(t)==tag_name).expect("collected type")}
-fn helpers(types:&BTreeSet<Type>,ops:&BTreeSet<String>,printed:&BTreeSet<Type>)->String {
+fn helpers(types:&BTreeSet<Type>,ops:&BTreeSet<String>,printed:&BTreeSet<Type>,gpu:bool)->String {
     let mut out=String::new();
     for ty in types {if *ty!=Type::F32 {out.push_str(&format!("typedef struct {{ float data[{}]; }} {};\n",count(ty),ctype(ty)));}}
     out.push('\n');
@@ -72,14 +72,36 @@ fn helpers(types:&BTreeSet<Type>,ops:&BTreeSet<String>,printed:&BTreeSet<Type>)-
                 let (m,k)=shape(l);let n=match rt {Type::Matrix(_,n)=>*n,Type::Vector(_)=>1,_=>unreachable!()};
                 let result=match rt {Type::Vector(_)=>Type::Vector(m),_=>Type::Matrix(m,n)};
                 let ct=ctype(&result); let at=ctype(l);let bt=ctype(rt);
-                out.push_str(&format!("static {ct} ml_matmul_{a}_{b}({at} a,{bt} b) {{ {ct} z={{0}}; for(size_t i=0;i<{m};++i) for(size_t j=0;j<{n};++j) for(size_t p=0;p<{k};++p) z.data[i*{n}+j]+=a.data[i*{k}+p]*b.data[p*{n}+j]; return z; }}\n"));
+                if gpu {
+                    out.push_str(&format!(r#"__global__ void ml_kernel_{a}_{b}(const float* a,const float* b,float* z) {{
+  size_t idx=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+  if(idx < {m}*{n}) {{ size_t i=idx/{n},j=idx%{n}; float acc=0.0f;
+    for(size_t p=0;p<{k};++p) acc+=a[i*{k}+p]*b[p*{n}+j]; z[idx]=acc; }}
+}}
+static {ct} ml_matmul_{a}_{b}({at} a,{bt} b) {{
+  {ct} z={{0}}; float *da=nullptr,*db=nullptr,*dz=nullptr;
+  ML_CUDA_CHECK(cudaMalloc((void**)&da,sizeof(a.data)));
+  ML_CUDA_CHECK(cudaMalloc((void**)&db,sizeof(b.data)));
+  ML_CUDA_CHECK(cudaMalloc((void**)&dz,sizeof(z.data)));
+  ML_CUDA_CHECK(cudaMemcpy(da,a.data,sizeof(a.data),cudaMemcpyHostToDevice));
+  ML_CUDA_CHECK(cudaMemcpy(db,b.data,sizeof(b.data),cudaMemcpyHostToDevice));
+  ml_kernel_{a}_{b}<<<({m}*{n}+255)/256,256>>>(da,db,dz);
+  ML_CUDA_CHECK(cudaGetLastError());
+  ML_CUDA_CHECK(cudaMemcpy(z.data,dz,sizeof(z.data),cudaMemcpyDeviceToHost));
+  ML_CUDA_CHECK(cudaFree(da)); ML_CUDA_CHECK(cudaFree(db)); ML_CUDA_CHECK(cudaFree(dz));
+  return z;
+}}
+"#));
+                } else {out.push_str(&format!("static {ct} ml_matmul_{a}_{b}({at} a,{bt} b) {{ {ct} z={{0}}; for(size_t i=0;i<{m};++i) for(size_t j=0;j<{n};++j) for(size_t p=0;p<{k};++p) z.data[i*{n}+j]+=a.data[i*{k}+p]*b.data[p*{n}+j]; return z; }}\n"));}
             }
             _=>{}
         }
     }
     out
 }
-pub fn emit_c(module:&Module)->String {
+pub fn emit_c(module:&Module)->String { emit_internal(module,false) }
+pub fn emit_cuda_c(module:&Module)->String { emit_internal(module,true) }
+fn emit_internal(module:&Module,cuda:bool)->String {
  let mut types=BTreeSet::new();let mut ops=BTreeSet::new();let mut printed=BTreeSet::new();
  for f in &module.functions {
   for (_,t) in &f.params {types.insert(t.clone());}
@@ -89,8 +111,12 @@ pub fn emit_c(module:&Module)->String {
    Statement::Print(e)=>{printed.insert(e.ty.clone());gather(e,&mut types,&mut ops);}
   }}
  }
- let mut out=String::from("/* Generated by MLang v0.4 direct typed IR backend. */\n#include <stdio.h>\n#include <stddef.h>\n#include <math.h>\n#include <stdlib.h>\n\n");
- out.push_str(&helpers(&types,&ops,&printed));out.push('\n');
+ let mut out=String::from("/* Generated by MLang v0.6 typed IR backend. */\n#include <stdio.h>\n#include <stddef.h>\n#include <math.h>\n#include <stdlib.h>\n\n");
+ if cuda { out.push_str(r#"#include <cuda_runtime.h>
+static void ml_cuda_error(cudaError_t e,const char* file,int line){ if(e!=cudaSuccess){ fprintf(stderr,"MLang CUDA failure at %s:%d: %s\n",file,line,cudaGetErrorString(e)); exit(3); }}
+#define ML_CUDA_CHECK(x) ml_cuda_error((x),__FILE__,__LINE__)
+"#); }
+ out.push_str(&helpers(&types,&ops,&printed,cuda));out.push('\n');
  for f in &module.functions {if f.name=="main" {continue;}let params=f.params.iter().map(|(n,t)|format!("{} ml_{n}",ctype(t))).collect::<Vec<_>>().join(", ");out.push_str(&format!("{} ml_{}({});\n",f.result.as_ref().map(ctype).unwrap_or("void".into()),f.name,if params.is_empty(){"void"}else{&params}));}
  for f in &module.functions {
   let is_main=f.name=="main";let name=if is_main {"main".into()}else{format!("ml_{}",f.name)};
@@ -98,10 +124,10 @@ pub fn emit_c(module:&Module)->String {
   let params=f.params.iter().map(|(n,t)|format!("{} ml_{n}",ctype(t))).collect::<Vec<_>>().join(", ");
   out.push_str(&format!("{ret} {name}({}) {{\n",if params.is_empty(){"void"}else{&params}));
   for stmt in &f.body {match stmt {
-   Statement::Let(n,e)=>out.push_str(&format!("  {} ml_{n} = {};\n",ctype(&e.ty),expr(e))),
-   Statement::Return(e)=>out.push_str(&format!("  return {};\n",expr(e))),
-   Statement::Print(e)=>if e.ty==Type::F32 {out.push_str(&format!("  printf(\"%.9g\\n\",(double)({}));\n",expr(e)));}else{out.push_str(&format!("  ml_print_{}({});\n",tag(&e.ty),expr(e)));},
-   Statement::Evaluate(e)=>out.push_str(&format!("  (void)({});\n",expr(e))),
+   Statement::Let(n,e)=>out.push_str(&format!("  {} ml_{n} = {};\n",ctype(&e.ty),expr(e,cuda))),
+   Statement::Return(e)=>out.push_str(&format!("  return {};\n",expr(e,cuda))),
+   Statement::Print(e)=>if e.ty==Type::F32 {out.push_str(&format!("  printf(\"%.9g\\n\",(double)({}));\n",expr(e,cuda)));}else{out.push_str(&format!("  ml_print_{}({});\n",tag(&e.ty),expr(e,cuda)));},
+   Statement::Evaluate(e)=>out.push_str(&format!("  (void)({});\n",expr(e,cuda))),
   }}
   if is_main {out.push_str("  return 0;\n");}
   out.push_str("}\n\n");
