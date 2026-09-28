@@ -30,16 +30,18 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     if args.is_empty() || args[0] != "build" {
-        return Err("usage: mlang import <model.mmdl> --output <file.ml> | mlang build <file.ml> [--output <binary>] [--emit-c <file.c>] [--cc <compiler>] [--target cpu|cuda]".into());
+        return Err("usage: mlang import <model.mmdl> --output <file.ml> | mlang build <file.ml> [--output <binary>] [--emit-c <file.c>] [--cc <compiler>] [--target cpu|cuda] [--emit-only]".into());
     }
     if args.len() < 2 { return Err("missing source file".into()); }
     let source = fs::read_to_string(&args[1]).map_err(|e| format!("cannot read {}: {e}", args[1]))?;
     let mut out_path = PathBuf::from("a.out");
     let mut emit_c = None;
+    let mut emit_only = false;
     let mut cc = "clang".to_string();
     let mut target = "cpu".to_string();
     let mut i = 2;
     while i < args.len() {
+        if args[i] == "--emit-only" { emit_only = true; i+=1; continue; }
         if i + 1 >= args.len() { return Err(format!("missing value for {}", args[i])); }
         match args[i].as_str() {
             "--output" => out_path = PathBuf::from(&args[i + 1]),
@@ -50,13 +52,21 @@ fn run() -> Result<(), String> {
         }
         i += 2;
     }
-    if target == "cuda" { return Err(backend::cuda::status().into()); }
-    if target != "cpu" { return Err(format!("unsupported target: {target}")); }
-    let c = compile(&source)?;
-    let c_path = emit_c.unwrap_or_else(|| out_path.with_extension("c"));
+    if target != "cpu" && target != "cuda" { return Err(format!("unsupported target: {target}")); }
+    let c = if target == "cuda" {
+        let tokens=lexer::lex(&source)?;
+        let ast=parser::Parser::new(tokens).program()?;
+        backend::cuda::emit_cuda(&ir::optimize(ir::lower(&ast)?))
+    } else { compile(&source)? };
+    let c_path = emit_c.unwrap_or_else(|| out_path.with_extension(if target=="cuda" {"cu"} else {"c"}));
     fs::write(&c_path, c).map_err(|e| format!("cannot write {}: {e}", c_path.display()))?;
-    let result = Command::new(&cc).arg("-std=c11").arg("-O2").arg("-Wall").arg("-Wextra")
-        .arg(&c_path).arg("-o").arg(&out_path).arg("-lm").status().map_err(|e| format!("cannot execute compiler '{cc}': {e}"))?;
+    if emit_only { println!("Generated {}",c_path.display()); return Ok(()); }
+    let compiler = if target == "cuda" && cc == "clang" { "nvcc" } else { &cc };
+    let mut command=Command::new(compiler);
+    if target=="cpu" { command.arg("-std=c11").arg("-Wall").arg("-Wextra"); }
+    command.arg("-O2").arg(&c_path).arg("-o").arg(&out_path);
+    if target=="cpu" { command.arg("-lm"); }
+    let result = command.status().map_err(|e| format!("cannot execute compiler '{compiler}': {e}. {}",if target=="cuda" { backend::cuda::status() } else { "Install Clang or set --cc" }))?;
     if !result.success() { return Err(format!("C compiler returned {result}")); }
     println!("Built {} (C source: {})", out_path.display(), c_path.display());
     Ok(())
@@ -70,5 +80,5 @@ mod tests {
     #[test] fn undefined_variable() { assert!(compile("fn main() { print(x); }").unwrap_err().contains("undefined")); }
     #[test] fn mismatched_dot() { assert!(compile("fn main() { print(dot([1,2],[3])); }").is_err()); }
     #[test] fn missing_return() { assert!(compile("fn f() -> f32 { let x = 2; } fn main() {}").is_err()); }
-    #[test] fn cuda_explicitly_unavailable() { assert!(backend::cuda::status().contains("planned")); }
+    #[test] fn cuda_explicitly_unavailable() { assert!(backend::cuda::status().contains("nvcc")); }
 }
