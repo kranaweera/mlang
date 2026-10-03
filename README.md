@@ -1,121 +1,53 @@
-# MLang v0.4.1 — Native inference compiler
+# MLang v0.6.0 — Experimental CUDA Milestone
 
-Built on Milestone 3. CPU backend now emits C **directly from typed IR** (without IR-to-AST conversion). Includes a small 2→3→1 dense ReLU network using embedded or external weights.
+Lightweight machine-learning compiler: native CPU inference, small dense-network model imports, and a **first genuine CUDA GPU kernel path for matrix multiplication**.
 
-## Run on macOS (Rust + Clang)
-
-```sh
-cargo test
-cargo build --release
-./target/release/mlang build examples/neural_embedded.ml --output neural_embedded
-./neural_embedded                     # [5]
-./target/release/mlang build examples/neural_external.ml --output neural_external
-./neural_external < examples/neural_weights.txt  # [5]
-./scripts/benchmark.sh
-```
-
-The external weight format is plain whitespace-separated FP32 decimal numbers, row-major, in `read_*()` invocation order. **The loader uses standard input**, so a weight file is supplied via redirection. Incorrect or truncated input exits with code 2; it is not yet a versioned model format.
-
-## Limitations
-
-* Fixed-shape rank <= 2 FP32 tensors, max 4096 elements, no broadcasting or dynamic allocation.
-* `read_vN()` and `read_mR_C()` read numbers from stdin. They do not implement named-file loading or secure weights validation.
-* Dense network uses existing matmul and ReLU operators, not fused kernels; no autodiff, training, CUDA, or operator fusion yet.
-* Compiler targets macOS/Linux via Clang; no standalone runtime benchmark harness yet beyond process-start wall time.
-* Embedded weights are handwritten numerical examples, not weights produced by a training pipeline.
-
-CUDA remains an intentionally unavailable backend. Binary sizes need measurement on your target system.
-
-## Size comparison
-
-```sh
-./scripts/neural_benchmark.sh
-```
-
-This reports file size and output (not inference-only latency). Compare against the 33 KB Milestone 3 baseline; process-level measurements do not represent isolated model latency.
-
-## Milestone 4 verification (v0.4.1)
-
-Run `./scripts/verify_neural.sh` to execute Rust tests, compile both network
-variants, and compare their outputs to a separate Python standard-library
-reference calculation. Python is **only used for development verification**;
-the compiled inference binary does not depend on Python.
-
-The external-weight loader now rejects truncated, malformed and non-finite
-(`NaN`, `Inf`) values with exit code 2. This is still a prototype stdin
-format, **not** a production-safe model file parser; extra trailing tokens
-are not rejected, and no model versioning, checksums, or authentication exist.
-
-The 2→3→1 network has **hand-chosen illustrative weights**, not weights
-learned by a training algorithm. No training functionality is claimed.
-
-A build/test run on macOS with Cargo and Clang is still required: the
-packaging environment used for this release does not provide Cargo.
-
-## Milestone 5 — portable dense model import (v0.5.0)
-
-MLang now imports a small **data-only** `.mmdl` format and emits ordinary `.ml`
-source that embeds the weights. It supports stacks of dense `f32` layers with
-`relu` or `linear` activations and a maximum of 4,096 elements per tensor.
-This is *not* general ONNX import, arbitrary scikit-learn import, or CUDA.
+## Mac (Apple Silicon) — CPU tests and CUDA source generation
 
 ```sh
 cargo test
 cargo build --release
-./target/release/mlang import examples/sample_model.mmdl --output imported.ml
-./target/release/mlang build imported.ml --output imported
-./imported
-./scripts/verify_import.sh
+./target/release/mlang build examples/matmul.ml --output matmul
+./matmul
+./target/release/mlang build examples/matmul.ml --target cuda --emit-only --emit-c matmul.cu
+./scripts/verify_cuda.sh
 ```
 
-Expected `./imported`: `[1.5]` for the generated zero input; a second verification
-probe with `[2, 3]` should produce `[5]`.
+`--emit-only` generates CUDA C++ code on your Mac but **does not run CUDA**. The generated `.cu` file is intended for an NVIDIA system.
 
-### Model interchange specification (MLANG-MODEL 1)
+## NVIDIA Linux host — compile and execute on GPU
 
-```text
-MLANG-MODEL 1
-input 2
-dense 3 relu
-weights 1 0 0 2 -1 1
-bias 0 0 1
-dense 1 linear
-weights 0.5 0.25 1
-bias 0.5
-```
-
-Each dense layer specifies the output width. `weights` has exactly `output * input`
-finite numbers in row-major `(output, input)` order; `bias` contains `output`
-finite numbers. Layers chain in file order. Generated source uses embedded weights;
-no model parser or Python runtime ships in the deployed binary. The generated
-`main` demonstrates inference on a *zero input*; edit it or invoke `predict()`
-with your own input to do useful predictions. No preprocessing/scaling metadata
-is serialized, so apply the same preprocessing as training externally.
-
-### Exporting an existing scikit-learn MLPRegressor
-
-In a separate, trusted training environment where scikit-learn and joblib are
-installed, train an `MLPRegressor` with `activation='relu'` or `'identity'`.
-Save it with `joblib.dump`, then run:
+Install NVIDIA drivers, CUDA Toolkit (`nvcc`), and a compatible GPU. Clone/copy the project onto that host, then:
 
 ```sh
-python3 tools/export_sklearn_mlp.py trusted_model.joblib model.mmdl
-./target/release/mlang import model.mmdl --output model.ml
-./target/release/mlang build model.ml --output model_native
+cargo build --release
+./target/release/mlang build examples/matmul.ml --target cuda --output matmul_gpu
+./matmul_gpu
+./scripts/verify_cuda.sh
 ```
 
-The exporter handles **only** `MLPRegressor`, not classifiers, and writes the
-matrix transpose required by MLang. Never load untrusted joblib/pickle files.
-For numerical comparison, use the same unscaled/scaled input in both runtimes;
-small differences are expected due to f32 arithmetic. The importer rejects
-invalid widths, missing values, unsupported activations, and non-finite weights.
+Expected matrix output: `[[19, 22], [43, 50]]`.
 
-### Benchmarking
+`--cc /path/to/nvcc` overrides the CUDA compiler location. The CPU backend still defaults to Clang.
+
+## Scope and limitations
+
+- `@` matrix-matrix and matrix-vector operators generate CUDA `__global__` kernels. CUDA allocations and host/device copies occur for each operation; this is **functionally GPU-executed**, not performance optimized.
+- Elementwise operations, `relu`, `sigmoid`, `dot`, print and parsing remain on CPU in this release. GPU kernel fusion, persistent device buffers, memory pooling and CPU/GPU performance wins are not claimed.
+- Uses CUDA **runtime API** (`cuda_runtime.h`, `nvcc`) rather than the previously envisioned Driver-API-only deployment. Build requires the CUDA Toolkit; executing the built program requires compatible CUDA runtime libraries and NVIDIA drivers. It is not a standalone driver-only binary.
+- CUDA is not available on current macOS systems. Run real CUDA tests on a compatible Linux or Windows NVIDIA machine.
+- CPU builds remain unchanged; Python/PyTorch are not needed for deployment.
+- CUDA compiler/toolchain was not available in the authoring environment, so GPU compilation/execution must be verified externally. The generated CUDA source is experimental.
+
+## Commands
 
 ```sh
-ls -lh model_native
-/usr/bin/time -l ./model_native  # macOS
+mlang import examples/sample_model.mmdl --output generated.ml
+mlang build generated.ml --target cpu --output model_cpu
+mlang build generated.ml --target cuda --output model_cuda
+mlang build examples/matmul.ml --target cuda --emit-only --emit-c matmul.cu
 ```
 
-Executable size varies by target and model; the previously measured 33 KB was
-for tiny examples, not a guarantee for imported models. CPU inference only.
+## Future CUDA milestones
+
+Persistent GPU buffers, GPU-side activations and fusion, PTX/cubin offline compilation, optional Driver API host stub, accurate GPU memory/latency benchmarks, and test matrices across compute capabilities.
