@@ -18,7 +18,7 @@ fn expr(e:&Expr, cuda:bool)->String {
   }
   ExprKind::Neg(x)=>if e.ty==Type::F32 {format!("(-{})",expr(x,cuda))} else {format!("ml_neg_{}({})",tag(&e.ty),expr(x,cuda))},
   ExprKind::Binary(a,op,b)=>if *op=='@' {format!("ml_matmul_{}_{}({}, {})",tag(&a.ty),tag(&b.ty),expr(a,cuda),expr(b,cuda))} else if e.ty==Type::F32 {format!("({} {op} {})",expr(a,cuda),expr(b,cuda))} else {let opname=match op {'+'=>"add",'-'=>"sub",'*'=>"mul",'/'=>"div",_=>unreachable!()};format!("ml_{opname}_{}({}, {})",tag(&e.ty),expr(a,cuda),expr(b,cuda))},
-  ExprKind::Call(n,args)=>{let rendered=args.iter().map(|a|expr(a,cuda)).collect::<Vec<_>>().join(", ");match n.as_str(){"dot"=>format!("ml_dot_{}({rendered})",tag(&args[0].ty)),"relu"|"sigmoid"=>format!("ml_{n}_{}({rendered})",tag(&args[0].ty)),_ if n.starts_with("read_v")||n.starts_with("read_m") =>format!("ml_{n}()"),_=>format!("ml_{n}({rendered})")}}
+  ExprKind::Call(n,args)=>{if cuda && n=="relu" && args.len()==1 { if let ExprKind::Binary(a, '@', b)=&args[0].kind {return format!("ml_matmul_relu_{}_{}({}, {})",tag(&a.ty),tag(&b.ty),expr(a,cuda),expr(b,cuda));} } let rendered=args.iter().map(|a|expr(a,cuda)).collect::<Vec<_>>().join(", ");match n.as_str(){"dot"=>format!("ml_dot_{}({rendered})",tag(&args[0].ty)),"relu"|"sigmoid"=>format!("ml_{n}_{}({rendered})",tag(&args[0].ty)),_ if n.starts_with("read_v")||n.starts_with("read_m") =>format!("ml_{n}()"),_=>format!("ml_{n}({rendered})")}}
  }
 }
 fn gather(e:&Expr,types:&mut BTreeSet<Type>,ops:&mut BTreeSet<String>) {
@@ -26,7 +26,7 @@ fn gather(e:&Expr,types:&mut BTreeSet<Type>,ops:&mut BTreeSet<String>) {
   ExprKind::Tensor(xs)=>for x in xs {gather(x,types,ops)},
   ExprKind::Neg(x)=>{gather(x,types,ops);if x.ty!=Type::F32 {ops.insert(format!("neg:{}",tag(&x.ty)));}},
   ExprKind::Binary(a,op,b)=>{gather(a,types,ops);gather(b,types,ops);if *op=='@' {ops.insert(format!("matmul:{}:{}",tag(&a.ty),tag(&b.ty)));}else if e.ty!=Type::F32 {ops.insert(format!("{}:{}",match op {'+'=>"add",'-'=>"sub",'*'=>"mul",'/'=>"div",_=>unreachable!()},tag(&e.ty)));}},
-  ExprKind::Call(n,args)=>{for a in args {gather(a,types,ops);}if ["relu","sigmoid","dot"].contains(&n.as_str()){ops.insert(format!("{n}:{}",tag(&args[0].ty)));}else if n.starts_with("read_v")||n.starts_with("read_m") {ops.insert(format!("read:{}",tag(&e.ty)));}},
+  ExprKind::Call(n,args)=>{for a in args {gather(a,types,ops);}if n=="relu" && args.len()==1 { if let ExprKind::Binary(a,'@',b)=&args[0].kind {ops.insert(format!("matmul_relu:{}:{}",tag(&a.ty),tag(&b.ty)));} } if ["relu","sigmoid","dot"].contains(&n.as_str()){ops.insert(format!("{n}:{}",tag(&args[0].ty)));}else if n.starts_with("read_v")||n.starts_with("read_m") {ops.insert(format!("read:{}",tag(&e.ty)));}},
   _=>{}
  }
 }
@@ -52,6 +52,7 @@ fn helpers(types:&BTreeSet<Type>,ops:&BTreeSet<String>,printed:&BTreeSet<Type>,g
         }}
         if ops.contains(&format!("neg:{nm}")) {out.push_str(&format!("static {ct} ml_neg_{nm}({ct} a) {{ {ct} z; for(size_t i=0;i<{n};++i) z.data[i]=-a.data[i]; return z; }}\n"));}
     }}
+    let mut emitted_matmuls=BTreeSet::new();
     for op in ops {
         if let Some(t)=op.strip_prefix("read:") {
             let ty=find_type(types,t);let ct=ctype(ty);let n=count(ty);
@@ -67,30 +68,46 @@ fn helpers(types:&BTreeSet<Type>,ops:&BTreeSet<String>,printed:&BTreeSet<Type>,g
                 if t=="f32" {let scalar_formula=if fn_name=="relu" {"(a>0?a:0)"}else{"(1.0f/(1.0f+expf(-a)))"};out.push_str(&format!("static float ml_{fn_name}_f32(float a) {{ return {scalar_formula}; }}\n"));}
                 else {let ty=find_type(types,t);let ct=ctype(ty);let n=count(ty);out.push_str(&format!("static {ct} ml_{fn_name}_{t}({ct} a) {{ {ct} z; for(size_t i=0;i<{n};++i) z.data[i]={formula}; return z; }}\n"));}
             }
-            &["matmul",a,b]=> {
+            &["matmul",a,b] | &["matmul_relu",a,b]=> {
+                if !emitted_matmuls.insert(format!("{a}:{b}")) { continue; }
                 let l=find_type(types,a);let rt=find_type(types,b);
                 let (m,k)=shape(l);let n=match rt {Type::Matrix(_,n)=>*n,Type::Vector(_)=>1,_=>unreachable!()};
                 let result=match rt {Type::Vector(_)=>Type::Vector(m),_=>Type::Matrix(m,n)};
                 let ct=ctype(&result); let at=ctype(l);let bt=ctype(rt);
                 if gpu {
-                    out.push_str(&format!(r#"__global__ void ml_kernel_{a}_{b}(const float* a,const float* b,float* z) {{
+                    // Each tensor signature owns reusable device buffers. The CUDA runtime
+                    // is initialized only when a matmul helper is first called.
+                    out.push_str(&format!(r#"static float *ml_da_{a}_{b}=nullptr, *ml_db_{a}_{b}=nullptr, *ml_dz_{a}_{b}=nullptr;
+static void ml_release_{a}_{b}(void) {{
+  if(ml_da_{a}_{b}) (void)cudaFree(ml_da_{a}_{b});
+  if(ml_db_{a}_{b}) (void)cudaFree(ml_db_{a}_{b});
+  if(ml_dz_{a}_{b}) (void)cudaFree(ml_dz_{a}_{b});
+}}
+static void ml_alloc_{a}_{b}(void) {{
+  if(ml_da_{a}_{b}) return;
+  ML_CUDA_CHECK(cudaMalloc((void**)&ml_da_{a}_{b},sizeof((({at}*)0)->data)));
+  ML_CUDA_CHECK(cudaMalloc((void**)&ml_db_{a}_{b},sizeof((({bt}*)0)->data)));
+  ML_CUDA_CHECK(cudaMalloc((void**)&ml_dz_{a}_{b},sizeof((({ct}*)0)->data)));
+  if(atexit(ml_release_{a}_{b}) != 0) {{ fprintf(stderr,"MLang CUDA: cannot register cleanup\n"); exit(3); }}
+}}
+__global__ void ml_kernel_{a}_{b}(const float* a,const float* b,float* z,int use_relu) {{
   size_t idx=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
   if(idx < {m}*{n}) {{ size_t i=idx/{n},j=idx%{n}; float acc=0.0f;
-    for(size_t p=0;p<{k};++p) acc+=a[i*{k}+p]*b[p*{n}+j]; z[idx]=acc; }}
+    for(size_t p=0;p<{k};++p) acc+=a[i*{k}+p]*b[p*{n}+j];
+    z[idx]=use_relu && acc<0.0f ? 0.0f : acc; }}
 }}
-static {ct} ml_matmul_{a}_{b}({at} a,{bt} b) {{
-  {ct} z={{0}}; float *da=nullptr,*db=nullptr,*dz=nullptr;
-  ML_CUDA_CHECK(cudaMalloc((void**)&da,sizeof(a.data)));
-  ML_CUDA_CHECK(cudaMalloc((void**)&db,sizeof(b.data)));
-  ML_CUDA_CHECK(cudaMalloc((void**)&dz,sizeof(z.data)));
-  ML_CUDA_CHECK(cudaMemcpy(da,a.data,sizeof(a.data),cudaMemcpyHostToDevice));
-  ML_CUDA_CHECK(cudaMemcpy(db,b.data,sizeof(b.data),cudaMemcpyHostToDevice));
-  ml_kernel_{a}_{b}<<<({m}*{n}+255)/256,256>>>(da,db,dz);
+static {ct} ml_matmul_impl_{a}_{b}({at} a,{bt} b,int use_relu) {{
+  {ct} z={{0}};
+  ml_alloc_{a}_{b}();
+  ML_CUDA_CHECK(cudaMemcpy(ml_da_{a}_{b},a.data,sizeof(a.data),cudaMemcpyHostToDevice));
+  ML_CUDA_CHECK(cudaMemcpy(ml_db_{a}_{b},b.data,sizeof(b.data),cudaMemcpyHostToDevice));
+  ml_kernel_{a}_{b}<<<({m}*{n}+255)/256,256>>>(ml_da_{a}_{b},ml_db_{a}_{b},ml_dz_{a}_{b},use_relu);
   ML_CUDA_CHECK(cudaGetLastError());
-  ML_CUDA_CHECK(cudaMemcpy(z.data,dz,sizeof(z.data),cudaMemcpyDeviceToHost));
-  ML_CUDA_CHECK(cudaFree(da)); ML_CUDA_CHECK(cudaFree(db)); ML_CUDA_CHECK(cudaFree(dz));
+  ML_CUDA_CHECK(cudaMemcpy(z.data,ml_dz_{a}_{b},sizeof(z.data),cudaMemcpyDeviceToHost));
   return z;
 }}
+static {ct} ml_matmul_{a}_{b}({at} a,{bt} b) {{ return ml_matmul_impl_{a}_{b}(a,b,0); }}
+static {ct} ml_matmul_relu_{a}_{b}({at} a,{bt} b) {{ return ml_matmul_impl_{a}_{b}(a,b,1); }}
 "#));
                 } else {out.push_str(&format!("static {ct} ml_matmul_{a}_{b}({at} a,{bt} b) {{ {ct} z={{0}}; for(size_t i=0;i<{m};++i) for(size_t j=0;j<{n};++j) for(size_t p=0;p<{k};++p) z.data[i*{n}+j]+=a.data[i*{k}+p]*b.data[p*{n}+j]; return z; }}\n"));}
             }
@@ -111,7 +128,7 @@ fn emit_internal(module:&Module,cuda:bool)->String {
    Statement::Print(e)=>{printed.insert(e.ty.clone());gather(e,&mut types,&mut ops);}
   }}
  }
- let mut out=String::from("/* Generated by MLang v0.6 typed IR backend. */\n#include <stdio.h>\n#include <stddef.h>\n#include <math.h>\n#include <stdlib.h>\n\n");
+ let mut out=String::from("/* Generated by MLang v0.7 typed IR backend. */\n#include <stdio.h>\n#include <stddef.h>\n#include <math.h>\n#include <stdlib.h>\n\n");
  if cuda { out.push_str(r#"#include <cuda_runtime.h>
 static void ml_cuda_error(cudaError_t e,const char* file,int line){ if(e!=cudaSuccess){ fprintf(stderr,"MLang CUDA failure at %s:%d: %s\n",file,line,cudaGetErrorString(e)); exit(3); }}
 #define ML_CUDA_CHECK(x) ml_cuda_error((x),__FILE__,__LINE__)
