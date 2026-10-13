@@ -1,53 +1,33 @@
-# MLang v0.6.0 — Experimental CUDA Milestone
+# MLang v0.7.0 — CUDA Buffer Reuse and Fused ReLU
 
-Lightweight machine-learning compiler: native CPU inference, small dense-network model imports, and a **first genuine CUDA GPU kernel path for matrix multiplication**.
+Builds on v0.6; maintains CPU functionality, model import, typed IR, and tensor operations.
 
-## Mac (Apple Silicon) — CPU tests and CUDA source generation
+## New
+- Reuses CUDA device buffers **per matrix multiplication tensor signature**, rather than allocating/freeing on every call. Allocations are released on process exit via `atexit`.
+- Fuses **direct** `relu(A @ B)` into the matrix multiplication CUDA kernel; the kernel applies ReLU before writing its result.
+- New `examples/cuda_fused_relu.ml` and `scripts/verify_cuda_v07.sh` for generation, CPU correctness, and optional CUDA execution checks.
 
+## Run on Mac
 ```sh
 cargo test
 cargo build --release
-./target/release/mlang build examples/matmul.ml --output matmul
-./matmul
-./target/release/mlang build examples/matmul.ml --target cuda --emit-only --emit-c matmul.cu
-./scripts/verify_cuda.sh
+./scripts/verify_cuda_v07.sh
 ```
+CUDA source generation works on macOS; NVIDIA CUDA **execution** needs compatible Linux or Windows with `nvcc`, driver, CUDA runtime and supported NVIDIA GPU.
 
-`--emit-only` generates CUDA C++ code on your Mac but **does not run CUDA**. The generated `.cu` file is intended for an NVIDIA system.
-
-## NVIDIA Linux host — compile and execute on GPU
-
-Install NVIDIA drivers, CUDA Toolkit (`nvcc`), and a compatible GPU. Clone/copy the project onto that host, then:
-
+## Run on NVIDIA host
 ```sh
 cargo build --release
-./target/release/mlang build examples/matmul.ml --target cuda --output matmul_gpu
-./matmul_gpu
-./scripts/verify_cuda.sh
+./target/release/mlang build examples/cuda_fused_relu.ml --target cuda --output fused_gpu
+./fused_gpu
+# [[0, 4], [6, 0]]
 ```
 
-Expected matrix output: `[[19, 22], [43, 50]]`.
+## Current limitations (important)
+- Device buffers are cached per **operator shape**, not across different GPU ops or entire inference graphs. Inputs and outputs are still copied for **every** matmul call, so there is **no end-to-end GPU residency**.
+- Only direct `relu(matmul)` is fused; e.g., `relu(A @ B + bias)` **is not fused**. Other tensor arithmetic and activations still run on CPU.
+- `nvcc` and CUDA Runtime API are required for CUDA compilation and CUDA runtime libraries at deployment. This is not yet a minimal Driver API/fully AOT backend.
+- Buffer cache is process-global, not thread-safe; this prototype is **not safe for concurrent inference calls**.
+- Performance improvements are **hypotheses**, not verified gains. Compare latency, allocations and binary size on NVIDIA hardware.
 
-`--cc /path/to/nvcc` overrides the CUDA compiler location. The CPU backend still defaults to Clang.
-
-## Scope and limitations
-
-- `@` matrix-matrix and matrix-vector operators generate CUDA `__global__` kernels. CUDA allocations and host/device copies occur for each operation; this is **functionally GPU-executed**, not performance optimized.
-- Elementwise operations, `relu`, `sigmoid`, `dot`, print and parsing remain on CPU in this release. GPU kernel fusion, persistent device buffers, memory pooling and CPU/GPU performance wins are not claimed.
-- Uses CUDA **runtime API** (`cuda_runtime.h`, `nvcc`) rather than the previously envisioned Driver-API-only deployment. Build requires the CUDA Toolkit; executing the built program requires compatible CUDA runtime libraries and NVIDIA drivers. It is not a standalone driver-only binary.
-- CUDA is not available on current macOS systems. Run real CUDA tests on a compatible Linux or Windows NVIDIA machine.
-- CPU builds remain unchanged; Python/PyTorch are not needed for deployment.
-- CUDA compiler/toolchain was not available in the authoring environment, so GPU compilation/execution must be verified externally. The generated CUDA source is experimental.
-
-## Commands
-
-```sh
-mlang import examples/sample_model.mmdl --output generated.ml
-mlang build generated.ml --target cpu --output model_cpu
-mlang build generated.ml --target cuda --output model_cuda
-mlang build examples/matmul.ml --target cuda --emit-only --emit-c matmul.cu
-```
-
-## Future CUDA milestones
-
-Persistent GPU buffers, GPU-side activations and fusion, PTX/cubin offline compilation, optional Driver API host stub, accurate GPU memory/latency benchmarks, and test matrices across compute capabilities.
+The compiler is experimental and is not validated for clinical or safety-critical deployment.
