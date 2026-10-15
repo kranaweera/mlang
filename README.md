@@ -250,4 +250,4 @@ Treat generated C/CUDA as a build artifact. Don't compile untrusted MLang progra
 
 ## License
 
-MIT, as declared in `Cargo.toml`.
+MIT. See [LICENSE](LICENSE).
